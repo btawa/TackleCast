@@ -24,6 +24,7 @@ Built for capture cards like the Genki ShadowCast, Elgato, AVerMedia, and other 
 - **Live picture controls** - brightness, contrast, saturation, gamma, and reset
 - **Live FPS counter** with separate nominal and delivered frame rates
 - **Auto-detect capture cards** via DirectShow and V4L2
+- **Elgato 4K X card settings** on Windows - EDID profiles (e.g. Switch 2 VRR or the PS5 default) or an EDID file, HDMI color range, EDID mode, audio input and HDR tone mapping, using an installed Elgato Studio's device library
 - **Four-tab settings** - Video, Picture, Audio, and Display, retaining the coral/navy theme
 - **Fullscreen support** (F11 or toggle in settings)
 - **Zero recording overhead** - purely a viewer
@@ -50,6 +51,46 @@ In TackleCast, press Escape and select the capture card's audio input and your s
 
 Audio input **Auto (follow video)** uses a unique name match for the selected video device. Without a unique match, audio stays disconnected; it never substitutes another capture card or your system microphone. Select an explicit input to use audio independently of video. If sound is missing, select the capture card's input and inspect the input/output formats in `logs/`. Unit tests cover routing, channel conversion and resampling; console-specific behavior still depends on the card and needs hardware validation.
 
+### Elgato 4K X settings and EDID (Windows)
+
+When an **Elgato 4K X** is selected, the Video tab adds two sections with the card settings Elgato Studio offers, so you don't need Studio open. Other capture cards never see them, and a setting only appears if the card reports supporting it.
+
+**Elgato 4K X** applies each change as soon as you pick it; the card stays connected:
+
+| Setting | Options |
+|---|---|
+| HDMI color range | Auto, Expand (limited to full), Shrink (full to limited). This is the card's own conversion, separate from TackleCast's **Color Range**, which only sets how the picture is interpreted. |
+| Input EDID mode | Internal (the card's EDID), Display (the pass-through monitor's EDID), Merged. Asks for confirmation: the console renegotiates HDMI, and the picture on TackleCast and a pass-through monitor can stay black until you undock and redock the console (or replug its HDMI cable). |
+| Audio input | HDMI audio, Analog line in, plus line-in gain |
+| HDR tone mapping | Convert HDR input to SDR on the card |
+
+It also shows whether the HDMI input is HDR. These settings are stored on the card.
+
+**Elgato EDID** shows the EDID active on the card and writes another one: one of Elgato's profiles, such as **4K X Switch 2 VRR** (Elgato's fix for Switch 2 freezes with VRR) or the default **Game Capture 4K X** for PS5; an EDID Elgato Studio saved; or any EDID file with **Load EDID file…**. Choose one, select **Apply EDID…**, then **Write EDID**. With **Input EDID mode** set to Display and a pass-through monitor connected, the console may see the monitor's EDID instead.
+
+Elgato Studio doesn't toggle a preset on the 4K X: it writes a whole EDID file into the card's flash. TackleCast does the same through Studio's own device library, so:
+
+- **Elgato's device library makes the changes**, so TackleCast needs it on the PC; it never ships Elgato's files. It uses, in order:
+  1. the library from an installed **Elgato Studio**, kept up to date by the Microsoft Store;
+  2. otherwise, a copy it **downloads from Elgato**. Without Studio, the menu offers **Download Elgato's device library**: one click, the first time only. TackleCast reads Elgato's current Studio package on `edge.elgato.com` and fetches just the four files it needs (about 5 MB of a 117 MB package), checks each against the package's size and CRC, and accepts the DLLs only with a valid Authenticode signature from Corsair Memory, Inc. (Elgato's parent company). After that it checks Elgato for a newer version once a day.
+  3. if the installed Studio and Elgato's newest package are both incompatible (an update renamed functions TackleCast calls), Studio **2.0.0.3364**, the version TackleCast was tested with. Its files must also match recorded SHA-256 hashes.
+
+  Each library must export every function TackleCast calls before it's used; the menu says which one is in use. Copies live in `%LOCALAPPDATA%\TackleCast\elgato-edid\lib\`, because Windows won't let other apps load DLLs from Studio's folder.
+- **Close Elgato Studio before changing anything.** TackleCast refuses to change the card while Studio holds it.
+- **Writing an EDID stops video and audio for about 20 s** while the card is re-flashed and reconnects; capture restarts by itself. Don't unplug the card until video returns.
+
+**Elgato's EDID list and files come from Elgato.** When a 4K X is selected and the menu reads the card, TackleCast checks Elgato's update service (`gc-updates.elgato.com`, the same one Studio uses) for the current EDID list, at most once a day. It downloads any EDID file the 4K X needs from Elgato's CDN (`edge.elgato.com`). Those, and the library download above once you've agreed to it, are the only network requests TackleCast makes. They go only to Elgato over HTTPS, carry no information about you, and nothing is sent unless a 4K X is selected. Without a connection, TackleCast uses the copy it saved last time, or Studio's. The list also tells TackleCast which USB product IDs belong to a 4K X, so a new revision is recognized without an update.
+
+Every Elgato profile is checked against the SHA-256 in Elgato's EDID list, both when it is downloaded and before it is written. A file you load must be a well-formed EDID (one to four 128-byte blocks, a valid header and a valid checksum on every block); TackleCast keeps a copy in `user-edids\` and lists it next time. After a write, the card is re-read to report the result. Elgato's library runs in a separate helper process, so a fault in it can't take down the viewer.
+
+**After an Elgato Studio update**, check that TackleCast still works with its library. This doesn't touch any card:
+
+```powershell
+.\TackleCast.exe --elgato-edid selftest | Out-String
+```
+
+It reports whether the installed Studio's library still has every function TackleCast uses (naming any that are missing), which library TackleCast will use, and whether Elgato's EDID list and the 4K X's EDID files are available. It reads the DLLs' export tables without loading them. The report is also saved as `selftest.txt` in the folder above, and the exit code is 0 when TackleCast can work with the card. Studio's library is private and undocumented: a Studio update that breaks it makes TackleCast fall back to a downloaded library, as above, and the self-test shows that as a note. To try the download path on a PC that has Studio, set `TACKLECAST_ELGATO_IGNORE_STUDIO=1`.
+
 ## Building from Source
 
 See [BUILD.md](BUILD.md) for platform dependencies, environment setup, tests, and packaging. After setting up the dependencies:
@@ -71,7 +112,7 @@ Press **Escape** to open the four-tab menu. Shorter tabs keep the same menu size
 
 | Tab | Controls |
 |---|---|
-| Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range |
+| Video | Capture device, supported resolution/FPS/format combinations, scaling filter, color space, and color range; Elgato 4K X settings and EDID on Windows |
 | Picture | Live brightness, contrast, saturation, and gamma adjustments, plus Reset Picture to Defaults |
 | Audio | Input/output devices, mute, volume, and connection status |
 | Display | Fullscreen, performance overlay, detailed scaling/color information, and Exit |
@@ -127,6 +168,7 @@ src/
   render.rs        - wgpu DX12/Vulkan renderer, YUV->RGB WGSL shader
   audio/           - Audio passthrough via cpal (WASAPI on Windows, PipeWire/ALSA on Linux)
   devices.rs       - Cross-platform video + audio device enumeration
+  elgato_edid/     - Elgato 4K X settings and EDID switching via Elgato Studio's library in a helper process (feature-gated: elgato-edid)
   settings.rs      - JSON settings load/save
   ui.rs            - egui overlay and settings menu
   logger.rs        - Rotating file logger via tracing

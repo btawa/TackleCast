@@ -31,6 +31,8 @@ winit = "0.30"
 libloading = { version = "0.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+# Unpacks Elgato's device library from the Studio package (already used by `image`).
+miniz_oxide = { version = "0.8", optional = true }
 windows = { version = "0.58", features = [
   "Win32_Media_Audio",
   "Win32_Media_DirectShow",
@@ -43,6 +45,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Variant",
   "Win32_Devices_FunctionDiscovery",
   "Win32_System_Threading",
+  "Win32_UI_Controls_Dialogs",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Direct3D12",
@@ -52,8 +55,10 @@ windows = { version = "0.58", features = [
 ] }
 
 [features]
-default = ["gpu-decode"]
+default = ["gpu-decode", "elgato-edid"]
 gpu-decode = ["dep:libloading"]
+# Switch an Elgato 4K X's EDID from the Video tab (Windows, needs Elgato Studio installed).
+elgato-edid = ["dep:miniz_oxide"]
 
 [profile.release]
 opt-level = 3

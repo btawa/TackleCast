@@ -7,6 +7,7 @@ mod color;
 mod devices;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod dx12_interop;
+mod elgato_edid;
 mod frame_rate;
 #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
 mod gpu_decode;
@@ -73,6 +74,16 @@ fn ui_redraw_needed(menu_open: bool, capture_live: bool) -> bool {
     menu_open || !capture_live
 }
 
+/// The window's native handle (HWND on Windows), so a dialog can stay in front
+/// of it. Zero elsewhere.
+fn window_handle(window: &Window) -> isize {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+        _ => 0,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TestPatternMode {
     Alternate,
@@ -115,6 +126,9 @@ impl CliArgs {
 fn main() {
     #[cfg(target_os = "windows")]
     if capabilities::handle_probe_args() {
+        return;
+    }
+    if elgato_edid::handle_helper_args() {
         return;
     }
     if let Err(error) = logger::init_logging() {
@@ -560,6 +574,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let toggle_fullscreen = prepared_ui.output.toggle_fullscreen;
                     let exit_requested = prepared_ui.output.exit_requested;
                     let apply_settings = prepared_ui.output.apply_settings.clone();
+                    let elgato_job = prepared_ui.output.elgato_job.clone();
+                    let pick_edid_file = prepared_ui.output.pick_edid_file;
                     if let Some(live) = &prepared_ui.output.live_video {
                         renderer.set_picture_settings(
                             live.brightness,
@@ -587,6 +603,12 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     if let Some(settings) = apply_settings {
                         self.apply_settings(settings);
+                    }
+                    if let Some((device, job)) = elgato_job {
+                        self.begin_elgato_job(&device, job);
+                    }
+                    if pick_edid_file {
+                        elgato_edid::pick_edid_file(window_handle(&window));
                     }
                     if exit_requested {
                         if let Some(capture) = &mut self.capture {
@@ -682,6 +704,15 @@ impl ApplicationHandler<AppEvent> for App {
                 capture.stop();
             }
             self.start_capture();
+        }
+
+        if let Some(finished) = elgato_edid::take_finished_job() {
+            self.finish_elgato_job(finished);
+        } else if elgato_edid::job_in_progress().is_some() {
+            // Keep the overlay's elapsed time moving while no frames arrive.
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
 
         // Periodic render summary (every 30s)
@@ -787,8 +818,70 @@ impl App {
         }
     }
 
+    /// Start a change on the Elgato card. An EDID write disconnects the card,
+    /// so capture and audio stop first and stay stopped until
+    /// [`Self::finish_elgato_job`] restarts them. Setting changes leave
+    /// capture running.
+    fn begin_elgato_job(&mut self, device: &str, job: elgato_edid::Job) {
+        let label = job.describe();
+        let pauses_capture = job.pauses_capture();
+        if pauses_capture {
+            if let Some(mut capture) = self.capture.take() {
+                capture.stop();
+            }
+            self.audio.stop();
+        }
+        if !elgato_edid::start_job(device, job) {
+            warn!("an Elgato card change is already running; ignoring {label}");
+            if pauses_capture {
+                self.start_capture();
+                self.start_audio();
+            }
+            return;
+        }
+        info!("starting Elgato card change {label} on {device}");
+        if pauses_capture {
+            self.latest_stats = None;
+            self.latest_error = None;
+            self.last_frame_at = None;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn finish_elgato_job(&mut self, finished: elgato_edid::FinishedJob) {
+        match &finished.result {
+            Ok(()) => info!("Elgato card change {} finished", finished.label),
+            Err(error) => error!("Elgato card change {} failed: {error}", finished.label),
+        }
+        if !finished.pauses_capture {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+        // The card re-enumerated; pick up its interfaces and modes again.
+        self.video_devices = devices::enumerate_video_devices();
+        self.settings.video_device =
+            devices::restore_video_device(&self.settings.video_device, &self.video_devices);
+        capabilities::refresh(&self.settings.video_device);
+        self.start_capture();
+        self.start_audio();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn overlay_info(&self) -> OverlayInfo {
-        let status_message = if let Some(error_message) = self.latest_error.as_ref() {
+        let edid_write = elgato_edid::job_in_progress().filter(|busy| busy.pauses_capture);
+        let status_message = if let Some(busy) = &edid_write {
+            Some(format!(
+                "Switching the card's EDID to {} ({}s). Don't unplug the card.",
+                busy.label,
+                busy.elapsed.as_secs()
+            ))
+        } else if let Some(error_message) = self.latest_error.as_ref() {
             Some(error_message.clone())
         } else if self.latest_stats.is_none() {
             Some("Connecting...".to_string())
@@ -823,7 +916,9 @@ impl App {
                 .and_then(|stats| stats.nominal_rate),
             detailed: self.settings.detailed_overlay,
             status_message,
-            status_is_alert: self.latest_error.is_some() || self.latest_stats.is_none(),
+            status_is_alert: edid_write.is_some()
+                || self.latest_error.is_some()
+                || self.latest_stats.is_none(),
         }
     }
 
@@ -839,6 +934,12 @@ impl App {
     }
 
     fn start_capture(&mut self) {
+        // The card is offline while its EDID is written; the write's completion
+        // restarts capture.
+        if elgato_edid::capture_paused() {
+            info!("deferring capture start until the Elgato EDID write finishes");
+            return;
+        }
         #[cfg(all(target_os = "windows", feature = "gpu-decode"))]
         {
             self.mf_gpu_active = false;
@@ -970,7 +1071,7 @@ impl App {
     }
 
     fn start_audio(&mut self) {
-        if self.test_mode {
+        if self.test_mode || elgato_edid::capture_paused() {
             return;
         }
 
